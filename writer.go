@@ -1,4 +1,3 @@
-// Copyright 2009 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -59,6 +58,7 @@ const (
 	NoCompression      CompressionLevel = -1
 	BestSpeed          CompressionLevel = -2
 	BestCompression    CompressionLevel = -3
+	NumThreads                          = 8
 
 	// Positive CompressionLevel values are reserved to mean a numeric zlib
 	// compression level, although that is not implemented yet.
@@ -368,154 +368,182 @@ func (e *encoder) writeImage(w io.Writer, m image.Image, cb int, level int) erro
 	paletted, _ := m.(*image.Paletted)
 	nrgba, _ := m.(*image.NRGBA)
 
-	for y := b.Min.Y; y < b.Max.Y; y++ {
-		// Convert from colors to bytes.
-		i := 1
-		switch cb {
-		case cbG8:
-			if gray != nil {
-				offset := (y - b.Min.Y) * gray.Stride
-				copy(cr[0][1:], gray.Pix[offset:offset+b.Dx()])
-			} else {
-				for x := b.Min.X; x < b.Max.X; x++ {
-					c := color.GrayModel.Convert(m.At(x, y)).(color.Gray)
-					cr[0][i] = c.Y
-					i++
-				}
-			}
-		case cbTC8:
-			// We have previously verified that the alpha value is fully opaque.
-			cr0 := cr[0]
-			stride, pix := 0, []byte(nil)
-			if rgba != nil {
-				stride, pix = rgba.Stride, rgba.Pix
-			} else if nrgba != nil {
-				stride, pix = nrgba.Stride, nrgba.Pix
-			}
-			if stride != 0 {
-				j0 := (y - b.Min.Y) * stride
-				j1 := j0 + b.Dx()*4
-				for j := j0; j < j1; j += 4 {
-					cr0[i+0] = pix[j+0]
-					cr0[i+1] = pix[j+1]
-					cr0[i+2] = pix[j+2]
-					i += 3
-				}
-			} else {
-				for x := b.Min.X; x < b.Max.X; x++ {
-					r, g, b, _ := m.At(x, y).RGBA()
-					cr0[i+0] = uint8(r >> 8)
-					cr0[i+1] = uint8(g >> 8)
-					cr0[i+2] = uint8(b >> 8)
-					i += 3
-				}
-			}
-		case cbP8:
-			if paletted != nil {
-				offset := (y - b.Min.Y) * paletted.Stride
-				copy(cr[0][1:], paletted.Pix[offset:offset+b.Dx()])
-			} else {
-				pi := m.(image.PalettedImage)
-				for x := b.Min.X; x < b.Max.X; x++ {
-					cr[0][i] = pi.ColorIndexAt(x, y)
-					i += 1
-				}
-			}
+	errorChan := make(chan error, 4)
 
-		case cbP4, cbP2, cbP1:
-			pi := m.(image.PalettedImage)
+	for workerId := 0; workerId < NumThreads; workerId++ {
+		interval := b.Max.Y - b.Min.Y
+		interval /= NumThreads
+		startOffset := (workerId * interval) + b.Min.Y
+		stopOffset := startOffset + interval - 1
+		go func(start, stop int, errChannel chan<- error) {
+			for y := start; y < stop; y++ {
+				// Convert from colors to bytes.
+				i := 1
+				switch cb {
+				case cbG8:
+					if gray != nil {
+						offset := (y - b.Min.Y) * gray.Stride
+						copy(cr[0][1:], gray.Pix[offset:offset+b.Dx()])
+					} else {
+						for x := b.Min.X; x < b.Max.X; x++ {
+							c := color.GrayModel.Convert(m.At(x, y)).(color.Gray)
+							cr[0][i] = c.Y
+							i++
+						}
+					}
+				case cbTC8:
+					// We have previously verified that the alpha value is fully opaque.
+					cr0 := cr[0]
+					stride, pix := 0, []byte(nil)
+					if rgba != nil {
+						stride, pix = rgba.Stride, rgba.Pix
+					} else if nrgba != nil {
+						stride, pix = nrgba.Stride, nrgba.Pix
+					}
+					if stride != 0 {
+						j0 := (y - b.Min.Y) * stride
+						j1 := j0 + b.Dx()*4
+						for j := j0; j < j1; j += 4 {
+							cr0[i+0] = pix[j+0]
+							cr0[i+1] = pix[j+1]
+							cr0[i+2] = pix[j+2]
+							i += 3
+						}
+					} else {
+						for x := b.Min.X; x < b.Max.X; x++ {
+							r, g, b, _ := m.At(x, y).RGBA()
+							cr0[i+0] = uint8(r >> 8)
+							cr0[i+1] = uint8(g >> 8)
+							cr0[i+2] = uint8(b >> 8)
+							i += 3
+						}
+					}
+				case cbP8:
+					if paletted != nil {
+						offset := (y - b.Min.Y) * paletted.Stride
+						copy(cr[0][1:], paletted.Pix[offset:offset+b.Dx()])
+					} else {
+						pi := m.(image.PalettedImage)
+						for x := b.Min.X; x < b.Max.X; x++ {
+							cr[0][i] = pi.ColorIndexAt(x, y)
+							i += 1
+						}
+					}
 
-			var a uint8
-			var c int
-			pixelsPerByte := 8 / bitsPerPixel
-			for x := b.Min.X; x < b.Max.X; x++ {
-				a = a<<uint(bitsPerPixel) | pi.ColorIndexAt(x, y)
-				c++
-				if c == pixelsPerByte {
-					cr[0][i] = a
-					i += 1
-					a = 0
-					c = 0
+				case cbP4, cbP2, cbP1:
+					pi := m.(image.PalettedImage)
+
+					var a uint8
+					var c int
+					pixelsPerByte := 8 / bitsPerPixel
+					for x := b.Min.X; x < b.Max.X; x++ {
+						a = a<<uint(bitsPerPixel) | pi.ColorIndexAt(x, y)
+						c++
+						if c == pixelsPerByte {
+							cr[0][i] = a
+							i += 1
+							a = 0
+							c = 0
+						}
+					}
+					if c != 0 {
+						for c != pixelsPerByte {
+							a = a << uint(bitsPerPixel)
+							c++
+						}
+						cr[0][i] = a
+					}
+
+				case cbTCA8:
+					if nrgba != nil {
+						offset := (y - b.Min.Y) * nrgba.Stride
+						copy(cr[0][1:], nrgba.Pix[offset:offset+b.Dx()*4])
+					} else {
+						// Convert from image.Image (which is alpha-premultiplied) to PNG's non-alpha-premultiplied.
+						for x := b.Min.X; x < b.Max.X; x++ {
+							c := color.NRGBAModel.Convert(m.At(x, y)).(color.NRGBA)
+							cr[0][i+0] = c.R
+							cr[0][i+1] = c.G
+							cr[0][i+2] = c.B
+							cr[0][i+3] = c.A
+							i += 4
+						}
+					}
+				case cbG16:
+					for x := b.Min.X; x < b.Max.X; x++ {
+						c := color.Gray16Model.Convert(m.At(x, y)).(color.Gray16)
+						cr[0][i+0] = uint8(c.Y >> 8)
+						cr[0][i+1] = uint8(c.Y)
+						i += 2
+					}
+				case cbTC16:
+					// We have previously verified that the alpha value is fully opaque.
+					for x := b.Min.X; x < b.Max.X; x++ {
+						r, g, b, _ := m.At(x, y).RGBA()
+						cr[0][i+0] = uint8(r >> 8)
+						cr[0][i+1] = uint8(r)
+						cr[0][i+2] = uint8(g >> 8)
+						cr[0][i+3] = uint8(g)
+						cr[0][i+4] = uint8(b >> 8)
+						cr[0][i+5] = uint8(b)
+						i += 6
+					}
+				case cbTCA16:
+					// Convert from image.Image (which is alpha-premultiplied) to PNG's non-alpha-premultiplied.
+					for x := b.Min.X; x < b.Max.X; x++ {
+						c := color.NRGBA64Model.Convert(m.At(x, y)).(color.NRGBA64)
+						cr[0][i+0] = uint8(c.R >> 8)
+						cr[0][i+1] = uint8(c.R)
+						cr[0][i+2] = uint8(c.G >> 8)
+						cr[0][i+3] = uint8(c.G)
+						cr[0][i+4] = uint8(c.B >> 8)
+						cr[0][i+5] = uint8(c.B)
+						cr[0][i+6] = uint8(c.A >> 8)
+						cr[0][i+7] = uint8(c.A)
+						i += 8
+					}
 				}
-			}
-			if c != 0 {
-				for c != pixelsPerByte {
-					a = a << uint(bitsPerPixel)
-					c++
+
+				// Apply the filter.
+				// Skip filter for NoCompression and paletted images (cbP8) as
+				// "filters are rarely useful on palette images" and will result
+				// in larger files (see http://www.libpng.org/pub/png/book/chapter09.html).
+				f := ftNone
+				if level != zlib.NoCompression && cb != cbP8 && cb != cbP4 && cb != cbP2 && cb != cbP1 {
+					// Since we skip paletted images we don't have to worry about
+					// bitsPerPixel not being a multiple of 8
+					bpp := bitsPerPixel / 8
+					f = filter(&cr, pr, bpp)
 				}
-				cr[0][i] = a
-			}
 
-		case cbTCA8:
-			if nrgba != nil {
-				offset := (y - b.Min.Y) * nrgba.Stride
-				copy(cr[0][1:], nrgba.Pix[offset:offset+b.Dx()*4])
-			} else {
-				// Convert from image.Image (which is alpha-premultiplied) to PNG's non-alpha-premultiplied.
-				for x := b.Min.X; x < b.Max.X; x++ {
-					c := color.NRGBAModel.Convert(m.At(x, y)).(color.NRGBA)
-					cr[0][i+0] = c.R
-					cr[0][i+1] = c.G
-					cr[0][i+2] = c.B
-					cr[0][i+3] = c.A
-					i += 4
+				// Write the compressed bytes.
+				if _, err := e.zw.Write(cr[f]); err != nil {
+					errChannel <- err
+					break
 				}
-			}
-		case cbG16:
-			for x := b.Min.X; x < b.Max.X; x++ {
-				c := color.Gray16Model.Convert(m.At(x, y)).(color.Gray16)
-				cr[0][i+0] = uint8(c.Y >> 8)
-				cr[0][i+1] = uint8(c.Y)
-				i += 2
-			}
-		case cbTC16:
-			// We have previously verified that the alpha value is fully opaque.
-			for x := b.Min.X; x < b.Max.X; x++ {
-				r, g, b, _ := m.At(x, y).RGBA()
-				cr[0][i+0] = uint8(r >> 8)
-				cr[0][i+1] = uint8(r)
-				cr[0][i+2] = uint8(g >> 8)
-				cr[0][i+3] = uint8(g)
-				cr[0][i+4] = uint8(b >> 8)
-				cr[0][i+5] = uint8(b)
-				i += 6
-			}
-		case cbTCA16:
-			// Convert from image.Image (which is alpha-premultiplied) to PNG's non-alpha-premultiplied.
-			for x := b.Min.X; x < b.Max.X; x++ {
-				c := color.NRGBA64Model.Convert(m.At(x, y)).(color.NRGBA64)
-				cr[0][i+0] = uint8(c.R >> 8)
-				cr[0][i+1] = uint8(c.R)
-				cr[0][i+2] = uint8(c.G >> 8)
-				cr[0][i+3] = uint8(c.G)
-				cr[0][i+4] = uint8(c.B >> 8)
-				cr[0][i+5] = uint8(c.B)
-				cr[0][i+6] = uint8(c.A >> 8)
-				cr[0][i+7] = uint8(c.A)
-				i += 8
-			}
-		}
 
-		// Apply the filter.
-		// Skip filter for NoCompression and paletted images (cbP8) as
-		// "filters are rarely useful on palette images" and will result
-		// in larger files (see http://www.libpng.org/pub/png/book/chapter09.html).
-		f := ftNone
-		if level != zlib.NoCompression && cb != cbP8 && cb != cbP4 && cb != cbP2 && cb != cbP1 {
-			// Since we skip paletted images we don't have to worry about
-			// bitsPerPixel not being a multiple of 8
-			bpp := bitsPerPixel / 8
-			f = filter(&cr, pr, bpp)
-		}
+				// The current row for y is the previous row for y+1.
+				pr, cr[0] = cr[0], pr
 
-		// Write the compressed bytes.
-		if _, err := e.zw.Write(cr[f]); err != nil {
+				errChannel <- nil
+			}
+		}(startOffset, stopOffset, errorChan)
+	}
+
+	doneWorkers := 0
+
+	for err := range errorChan {
+		doneWorkers++
+		if err != nil {
 			return err
 		}
 
-		// The current row for y is the previous row for y+1.
-		pr, cr[0] = cr[0], pr
+		if doneWorkers == NumThreads {
+			close(errorChan)
+			break
+		}
 	}
+
 	return nil
 }
 
